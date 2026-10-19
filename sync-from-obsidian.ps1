@@ -1,4 +1,4 @@
-# 从 Obsidian 同步文章到本仓库：复制正文与配图，并把 Obsidian 的 wikilink 转成标准 Markdown
+﻿# 从 Obsidian 同步文章到本仓库：复制正文与配图，并把 Obsidian 的 wikilink 转成标准 Markdown
 $src  = 'C:\Users\23914\Documents\Obsidian Vault\阿里云'
 $name = '阿里云 ACK 托管集群实战 架构规划与 CI-CD 全流程交付.md'
 $dst  = Split-Path -Parent $MyInvocation.MyCommand.Path
