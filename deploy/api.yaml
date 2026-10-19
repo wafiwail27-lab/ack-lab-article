@@ -1,0 +1,102 @@
+# 阶段四 · ack-api（2 副本）：Deployment + ClusterIP Service
+# 镜像按 digest 固定；入口用 command 覆盖（镜像本身不设 ENTRYPOINT）
+# /healthz 不依赖数据库，保证 DB 故障时 Pod 不会连环重启；DB 状态看 /db-check
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ack-api
+  namespace: demo
+  labels:
+    app: ack-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ack-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: ack-api
+    spec:
+      automountServiceAccountToken: false
+      imagePullSecrets:
+      - name: acr-pull
+      containers:
+      - name: api
+        image: crpi-xxxxxxxxxxxx-vpc.cn-hangzhou.personal.cr.aliyuncs.com/yunshiyan/ack-api@sha256:2c57bfcae161f4b5addb2d24cd83aeb9dedacd6f92a3132785649c12b288e815
+        command:
+        - python
+        - /app/app.py
+        ports:
+        - name: http
+          containerPort: 8080
+        env:
+        - name: PORT
+          value: "8080"
+        - name: DB_HOST
+          value: mysql
+        - name: DB_PORT
+          value: "3306"
+        - name: DB_NAME
+          value: demo
+        - name: DB_USER
+          value: appuser
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mysql-secret
+              key: app-password
+        - name: PYTHONDONTWRITEBYTECODE
+          value: "1"
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 300m
+            memory: 256Mi
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: http
+          initialDelaySeconds: 3
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: http
+          periodSeconds: 10
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: tmp
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ack-api
+  namespace: demo
+  labels:
+    app: ack-api
+spec:
+  type: ClusterIP
+  selector:
+    app: ack-api
+  ports:
+  - name: http
+    port: 8080
+    targetPort: http

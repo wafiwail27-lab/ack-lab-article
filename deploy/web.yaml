@@ -1,0 +1,67 @@
+# 阶段四 · ack-web（2 副本）：Deployment + ClusterIP Service
+# 镜像按 digest 固定；nginx 默认入口，静态页在 /usr/share/nginx/html/index.html
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ack-web
+  namespace: demo
+  labels:
+    app: ack-web
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ack-web
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: ack-web
+    spec:
+      automountServiceAccountToken: false
+      imagePullSecrets:
+      - name: acr-pull
+      containers:
+      - name: web
+        image: crpi-xxxxxxxxxxxx-vpc.cn-hangzhou.personal.cr.aliyuncs.com/yunshiyan/ack-web@sha256:b03a241129f65f1641d07e78385086643a0b70fea692758c9a233f538b937c69
+        ports:
+        - name: http
+          containerPort: 80
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 128Mi
+        readinessProbe:
+          httpGet:
+            path: /index.html
+            port: http
+          initialDelaySeconds: 2
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /index.html
+            port: http
+          periodSeconds: 15
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ack-web
+  namespace: demo
+  labels:
+    app: ack-web
+spec:
+  type: ClusterIP
+  selector:
+    app: ack-web
+  ports:
+  - name: http
+    port: 80
+    targetPort: http

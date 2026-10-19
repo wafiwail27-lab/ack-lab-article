@@ -1,0 +1,214 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: wecom-adapter-script
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: wecom-adapter
+    app.kubernetes.io/part-of: ack-monitoring-lab
+data:
+  adapter.py: |
+    import json
+    import os
+    import urllib.request
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    WECOM_URL = os.environ.get("WECOM_WEBHOOK_URL", "").strip()
+    LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8080"))
+    MAX_CONTENT_BYTES = 3800
+
+
+    def log(msg):
+        print("[wecom-adapter] " + str(msg), flush=True)
+
+
+    def trim(content):
+        raw = content.encode("utf-8")
+        if len(raw) <= MAX_CONTENT_BYTES:
+            return content
+        return raw[:MAX_CONTENT_BYTES].decode("utf-8", "ignore") + "\n...(truncated)"
+
+
+    def render(payload):
+        status = payload.get("status", "unknown")
+        alerts = payload.get("alerts", [])
+        title = "alert firing" if status == "firing" else "alert resolved"
+        lines = ["## " + title + " (" + str(len(alerts)) + ")"]
+        for item in alerts[:10]:
+            labels = item.get("labels", {})
+            ann = item.get("annotations", {})
+            lines.append("> alertname: **" + str(labels.get("alertname", "-")) + "**  severity: " + str(labels.get("severity", "-")))
+            if ann.get("summary"):
+                lines.append("> summary: " + str(ann.get("summary")))
+            target = labels.get("instance") or labels.get("node") or labels.get("deployment") or "-"
+            lines.append("> target: " + str(target) + "  status: " + str(item.get("status", "-")))
+            lines.append("> startsAt: " + str(item.get("startsAt", "-")))
+            lines.append("")
+        lines.append("source: ACK self-built monitoring (Prometheus -> Alertmanager -> adapter)")
+        return trim("\n".join(lines))
+
+
+    def push(content):
+        body = json.dumps({"msgtype": "markdown", "markdown": {"content": content}}, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(WECOM_URL, data=body, headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            text = resp.read().decode("utf-8", "ignore")
+        return json.loads(text).get("errcode") == 0, text
+
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def _send(self, code, body):
+            raw = str(body).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_GET(self):
+            if self.path == "/healthz":
+                self._send(200, "ok")
+            else:
+                self._send(404, "not found")
+
+        def do_POST(self):
+            if self.path != "/webhook":
+                self._send(404, "not found")
+                return
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            raw = self.rfile.read(length) if length else b"{}"
+            try:
+                payload = json.loads(raw.decode("utf-8", "ignore") or "{}")
+            except ValueError as exc:
+                log("invalid payload: " + str(exc))
+                self._send(400, "invalid json")
+                return
+            log("received payload: status=" + str(payload.get("status")) + " alerts=" + str(len(payload.get("alerts", []))))
+            if not WECOM_URL:
+                log("wecom webhook url is empty, abort")
+                self._send(500, "wecom url missing")
+                return
+            try:
+                ok, text = push(render(payload))
+                log("wecom accepted=" + str(ok))
+                self._send(200 if ok else 502, text)
+            except Exception as exc:
+                log("push failed: " + str(exc))
+                self._send(500, "push failed")
+
+        def log_message(self, fmt, *args):
+            log(fmt % args)
+
+
+    def main():
+        log("listening on :" + str(LISTEN_PORT) + " wecom_url_configured=" + str(bool(WECOM_URL)))
+        ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), Handler).serve_forever()
+
+
+    if __name__ == "__main__":
+        main()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wecom-adapter
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: wecom-adapter
+    app.kubernetes.io/part-of: ack-monitoring-lab
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: wecom-adapter
+  template:
+    metadata:
+      labels:
+        app: wecom-adapter
+        app.kubernetes.io/name: wecom-adapter
+    spec:
+      imagePullSecrets:
+        - name: acr-pull
+      # 通知出口必须走绑有 EIP 的节点宿主网络：ACK 节点无 NAT，Terway Pod 网络即使
+      # 在有公网 IP 的节点上也没有出网能力，只有 hostNetwork 能借用节点 EIP。
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        egress: public
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+      containers:
+        - name: adapter
+          image: crpi-xxxxxxxxxxxx-vpc.cn-hangzhou.personal.cr.aliyuncs.com/yunshiyan/ack-api:python-3.12-alpine
+          command: ["python", "/app/adapter.py"]
+          env:
+            - name: LISTEN_PORT
+              value: "8080"
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            - name: WECOM_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: wecom-webhook
+                  key: url
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 20
+            failureThreshold: 5
+          volumeMounts:
+            - name: script
+              mountPath: /app/adapter.py
+              subPath: adapter.py
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: script
+          configMap:
+            name: wecom-adapter-script
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: wecom-adapter
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: wecom-adapter
+    app.kubernetes.io/part-of: ack-monitoring-lab
+spec:
+  type: ClusterIP
+  selector:
+    app: wecom-adapter
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      protocol: TCP

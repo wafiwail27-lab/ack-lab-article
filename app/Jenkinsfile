@@ -1,0 +1,150 @@
+// ACK Lab 交付流水线：Git -> Jenkins -> ACR -> ACK 滚动发布
+// 两个 Jenkins 凭据（Credentials）：
+//   acr-cred        类型 Username with password，值 = 仅授权该 ACR 命名空间的 RAM 用户与访问凭证
+//   ack-kubeconfig  类型 Secret file，值 = 可访问集群的 kubeconfig（建议用最小权限 ServiceAccount 的副本）
+// ACTION=deploy   构建并发布；ACTION=rollback  回滚最近一次发布
+pipeline {
+    agent any
+
+    options {
+        // 同一时间只允许一个发布，避免两个构建互相覆盖镜像
+        disableConcurrentBuilds()
+        timestamps()
+    }
+
+    triggers {
+        // 轮询 Gitee 仓库（Jenkins 只监听回环，无法被公网 webhook 直连）
+        pollSCM('H/2 * * * *')
+    }
+
+    parameters {
+        choice(name: 'ACTION', choices: ['deploy', 'rollback'], description: 'deploy：构建+推送+滚动发布；rollback：回滚两个 Deployment')
+        string(name: 'TAG', defaultValue: '', description: '镜像标签，留空则用 v<BUILD_NUMBER>')
+    }
+
+    environment {
+        ACR_HOST = 'crpi-xxxxxxxxxxxx-vpc.cn-hangzhou.personal.cr.aliyuncs.com'
+        ACR_NAMESPACE = 'yunshiyan'
+        K8S_NAMESPACE = 'demo'
+        APP_CLIENT_POD = 'acr-gate-nginx-v1'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                sh 'git log --oneline -1'
+            }
+        }
+
+        stage('Prepare') {
+            steps {
+                script {
+                    env.IMAGE_TAG = params.TAG ?: "v${env.BUILD_NUMBER}"
+                    echo "image tag = ${env.IMAGE_TAG}"
+                }
+            }
+        }
+
+        stage('Rollback') {
+            when { expression { params.ACTION == 'rollback' } }
+            steps {
+                withCredentials([file(credentialsId: 'ack-kubeconfig', variable: 'KUBECONFIG_FILE')]) {
+                    sh '''
+                        set -eu
+                        export KUBECONFIG="$KUBECONFIG_FILE"
+                        kubectl -n "$K8S_NAMESPACE" rollout undo deployment/ack-web
+                        kubectl -n "$K8S_NAMESPACE" rollout undo deployment/ack-api
+                        kubectl -n "$K8S_NAMESPACE" rollout status deployment/ack-web --timeout=180s
+                        kubectl -n "$K8S_NAMESPACE" rollout status deployment/ack-api --timeout=180s
+                        kubectl -n "$K8S_NAMESPACE" rollout history deployment/ack-web
+                    '''
+                }
+            }
+        }
+
+        stage('Login') {
+            // 基础镜像在 ACR 私有仓库，docker build 前必须先登录，否则拉取 base image 会 unauthorized
+            when { expression { params.ACTION == 'deploy' } }
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'acr-cred', usernameVariable: 'ACR_USER', passwordVariable: 'ACR_PASS')]) {
+                    sh 'echo "$ACR_PASS" | docker login -u "$ACR_USER" --password-stdin "$ACR_HOST"'
+                }
+            }
+        }
+
+        stage('Build') {
+            when { expression { params.ACTION == 'deploy' } }
+            steps {
+                sh '''
+                    set -eu
+                    sed -i -e "s/__BUILD_TAG__/${IMAGE_TAG}/" -e "s/__BUILD_DATE__/$(date +%F)/" web/index.html
+                    # --provenance=false --sbom=false：默认会额外生成 provenance 证明清单（config 的
+                    # mediaType 是 application/vnd.oci.empty.v1+json），ACR 个人版不识别该 manifest 类型，
+                    # push 会报 "unknown manifest class for application/vnd.oci.empty.v1+json"
+                    docker build --provenance=false --sbom=false -f web/Dockerfile -t "$ACR_HOST/$ACR_NAMESPACE/ack-web:$IMAGE_TAG" web
+                    docker build --provenance=false --sbom=false -f api/Dockerfile -t "$ACR_HOST/$ACR_NAMESPACE/ack-api:$IMAGE_TAG" api
+                '''
+            }
+        }
+
+        stage('Push') {
+            when { expression { params.ACTION == 'deploy' } }
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'acr-cred', usernameVariable: 'ACR_USER', passwordVariable: 'ACR_PASS')]) {
+                    sh '''
+                        set -eu
+                        docker push "$ACR_HOST/$ACR_NAMESPACE/ack-web:$IMAGE_TAG"
+                        docker push "$ACR_HOST/$ACR_NAMESPACE/ack-api:$IMAGE_TAG"
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy') {
+            when { expression { params.ACTION == 'deploy' } }
+            steps {
+                withCredentials([file(credentialsId: 'ack-kubeconfig', variable: 'KUBECONFIG_FILE')]) {
+                    sh '''
+                        set -eu
+                        export KUBECONFIG="$KUBECONFIG_FILE"
+                        WEB_IMAGE=$(docker inspect --format "{{index .RepoDigests 0}}" "$ACR_HOST/$ACR_NAMESPACE/ack-web:$IMAGE_TAG")
+                        API_IMAGE=$(docker inspect --format "{{index .RepoDigests 0}}" "$ACR_HOST/$ACR_NAMESPACE/ack-api:$IMAGE_TAG")
+                        echo "web image -> $WEB_IMAGE"
+                        echo "api image -> $API_IMAGE"
+                        kubectl -n "$K8S_NAMESPACE" set image deployment/ack-web web="$WEB_IMAGE"
+                        kubectl -n "$K8S_NAMESPACE" set image deployment/ack-api api="$API_IMAGE"
+                        kubectl -n "$K8S_NAMESPACE" rollout status deployment/ack-web --timeout=180s
+                        kubectl -n "$K8S_NAMESPACE" rollout status deployment/ack-api --timeout=180s
+                        kubectl -n "$K8S_NAMESPACE" get pods -o wide
+                    '''
+                }
+            }
+        }
+
+        stage('Verify') {
+            when { expression { params.ACTION == 'deploy' } }
+            steps {
+                withCredentials([file(credentialsId: 'ack-kubeconfig', variable: 'KUBECONFIG_FILE')]) {
+                    sh '''
+                        set -eu
+                        export KUBECONFIG="$KUBECONFIG_FILE"
+                        kubectl -n "$K8S_NAMESPACE" exec "$APP_CLIENT_POD" -- wget -qO- http://ack-web.demo.svc.cluster.local/ > /tmp/web-page.html
+                        grep -q "ACK-WEB-$IMAGE_TAG" /tmp/web-page.html
+                        echo "[ok] 集群内已返回新版本页面 ACK-WEB-$IMAGE_TAG"
+                        kubectl -n "$K8S_NAMESPACE" exec "$APP_CLIENT_POD" -- wget -qO- http://ack-api.demo.svc.cluster.local:8080/db-check
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "pipeline success: action=${params.ACTION} tag=${env.IMAGE_TAG}"
+        }
+        failure {
+            echo 'pipeline failed：查看失败阶段日志；Deployment 为 maxUnavailable=0，旧 Pod 会继续服务，不会因发布失败而整体不可用'
+        }
+    }
+}

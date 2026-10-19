@@ -1,0 +1,105 @@
+# 阶段四 · MySQL 8.0：headless Service + StatefulSet + 20Gi ESSD 云盘 PVC
+# 计费：PVC 被 Pod 使用时会创建云盘（估算 +0.5~1 元/天，以账单为准）
+# 回滚：kubectl -n demo delete -f mysql.yaml；删除 PVC 后云盘按 StorageClass 的 Delete 策略自动释放，计费停止
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql
+  namespace: demo
+  labels:
+    app: mysql
+spec:
+  clusterIP: None
+  selector:
+    app: mysql
+  ports:
+  - name: mysql
+    port: 3306
+    targetPort: 3306
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+  namespace: demo
+  labels:
+    app: mysql
+spec:
+  serviceName: mysql
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysql
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      automountServiceAccountToken: false
+      imagePullSecrets:
+      - name: acr-pull
+      containers:
+      - name: mysql
+        image: crpi-xxxxxxxxxxxx-vpc.cn-hangzhou.personal.cr.aliyuncs.com/yunshiyan/mysql@sha256:62fb722c78b24245ddff1796a0fcee4a49cc5b87e0aaaf20c92d1da9e0a2497b
+        args:
+        - --character-set-server=utf8mb4
+        - --collation-server=utf8mb4_unicode_ci
+        ports:
+        - name: mysql
+          containerPort: 3306
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mysql-secret
+              key: root-password
+        - name: MYSQL_DATABASE
+          value: demo
+        resources:
+          requests:
+            cpu: 250m
+            memory: 512Mi
+          limits:
+            cpu: "1"
+            memory: 1Gi
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/mysql
+        - name: initdb
+          mountPath: /docker-entrypoint-initdb.d
+          readOnly: true
+        startupProbe:
+          tcpSocket:
+            port: 3306
+          periodSeconds: 5
+          failureThreshold: 60
+        readinessProbe:
+          exec:
+            command:
+            - sh
+            - -c
+            - mysqladmin ping -h 127.0.0.1
+          periodSeconds: 10
+          timeoutSeconds: 5
+        livenessProbe:
+          exec:
+            command:
+            - sh
+            - -c
+            - mysqladmin ping -h 127.0.0.1
+          periodSeconds: 20
+          timeoutSeconds: 5
+      volumes:
+      - name: initdb
+        secret:
+          secretName: mysql-initdb
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      storageClassName: alicloud-disk-topology-alltype
+      resources:
+        requests:
+          storage: 20Gi
