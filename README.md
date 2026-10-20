@@ -88,6 +88,10 @@
 
 *云资源骨架 + 集群内工作负载：EIP 只绑 j 区节点，两个节点分处两个可用区，MySQL 数据落 ESSD 云盘。*
 
+![ACK-09-交付与运行拓扑.png](images/ACK-09-交付与运行拓扑.png)
+
+*交付与运行拓扑：上半部分是 CI/CD 链路（本机 → Gitee → Jenkins → ACR），下半部分是集群内的入口与工作负载（ingress-nginx → Service → ack-web / ack-api → mysql-0）。*
+
 对应的纯文本结构如下，便于在不支持图片的环境中使用：
 
 ```text
